@@ -1,0 +1,23 @@
+# Python artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local market data, licensed vendor responses, and generated investment research
+fof_pit_data/
+run_outputs/
+.cache/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*token*
+*credential*
+
+# OS/editor files
+.DS_Store
+.vscode/

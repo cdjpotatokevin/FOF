@@ -1,0 +1,13 @@
+# 核心依赖（必需）
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+
+# 数据源（任选其一即可跑通；akshare 免费、无需 token）
+akshare>=1.12
+# iFinD：通过 ifind-finance-data skill 的 call.py 走 MCP（需在 skill 的
+#        mcp_config.json 填入真实 auth_token）。Python 侧仅需 requests。
+requests>=2.28
+
+# 测试
+pytest>=7.0
