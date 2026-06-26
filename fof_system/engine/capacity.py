@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import pandas as pd
+from typing import Mapping, Any
+
+
+ACTIVE_FUND_CAPACITY_SAFETY_BUFFER = 0.9999
 
 
 def etf_capacity_report(
@@ -91,3 +95,34 @@ def etf_capacity_weight_caps(
         / float(portfolio_aum_yi)
     )
     return caps.clip(lower=0.0, upper=1.0)
+
+
+def active_fund_capacity_weight_caps(
+    fund_codes: list[str],
+    asset_metadata: Mapping[str, Mapping[str, Any]],
+    *,
+    portfolio_aum_yi: float,
+    max_order_to_fund_aum: float = 0.20,
+) -> pd.Series:
+    """主动基金首次申购的权重上限。
+
+    ``订单金额 / 标的基金最新规模 <= max_order_to_fund_aum``。规模缺失或非正时返回
+    0，避免在缺少容量证据时配置该产品；实际单日限额由严格基金池另行拦截。
+
+    约束内部保留一个极小安全垫，避免在导出规模四舍五入、求解器容差等情形下，
+    输出表按展示口径重算后出现 20.000x% 这类边界越线。
+    """
+    if portfolio_aum_yi <= 0:
+        raise ValueError("portfolio_aum_yi 必须为正数")
+    if not 0 < max_order_to_fund_aum <= 1:
+        raise ValueError("max_order_to_fund_aum 必须在 (0, 1] 内")
+    caps: dict[str, float] = {}
+    for code in fund_codes:
+        meta = asset_metadata.get(str(code), {})
+        aum = pd.to_numeric(meta.get("aum_yi"), errors="coerce")
+        cap = (
+            float(max_order_to_fund_aum * ACTIVE_FUND_CAPACITY_SAFETY_BUFFER * aum / portfolio_aum_yi)
+            if pd.notna(aum) and aum > 0 else 0.0
+        )
+        caps[str(code)] = min(max(cap, 0.0), 1.0)
+    return pd.Series(caps, dtype=float)

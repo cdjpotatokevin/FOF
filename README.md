@@ -121,6 +121,9 @@ python -m fof_system.run_data --root /data/fof_pit import-holdings \
 > 股票ETF必须有明确 `is_stock_etf=true`、`is_qdii=false` 标签且AUM不低于5亿元。
 > 数据缺失时系统不会猜测并放行，因此导入历史主数据时请包含 `aum_yi`、`inception`，
 > ETF还需包含 `asset_type`、`is_stock_etf` 和 `is_qdii`。
+> 主动基金还必须为开放申购状态；`暂停大额申购`、`限额/限购/限制申购`及供应商显式给出的
+> `daily_subscription_limit_yi` 或 `has_daily_subscription_limit=true` 均会被严格排除。
+> 若供应商未给出数值限额，交易日仍须以渠道回传的实际限额复核，不能把空字段解释为“无限额”。
 
 # === 第②层 基金打分 ===
 # 1) 离线自检（合成数据，验证整条链路与 RBSA 还原能力）
@@ -156,12 +159,13 @@ python -m fof_system.run_portfolio --source akshare --target-growth 0.75 \
     --codes 005827,163406,110011,161005,260108 --max-weight 0.12 --gamma 8
 # 8b) 正式全池筛选：对PIT严格合规池评分，不按规模前N名预截断；
 #     优化器使用“风格调整后alpha × RBSA R²”再收缩后的期望alpha，并从全池
-#     补入高分低成长主动基金，且仅允许PIT状态为开放申购的主动基金；
-#     单基金上限10%，同时给出5只未持有备选，避免因临时停购无法建仓。
+#     补入高分低成长主动基金，且仅允许PIT状态为开放申购、无暂停大额申购/单日限额的主动基金；
+#     单基金上限10%，且单笔主动基金申购额不超过该基金规模的20%；默认保留20只主动候选、
+#     至少6只低成长侧补足候选，同时给出5只未持有备选。
 python -m fof_system.run_portfolio --source akshare --pit-root /data/fof_pit \
     --universe-asof 2026-06-23 --end 2026-06-23 --all-eligible \
     --score-out full_universe_scores.csv \
-    --portfolio-aum-yi 14 --capacity-asof 2026-06-24 --backup-out backup_funds.csv
+    --portfolio-aum-yi 14 --max-order-to-fund-aum 0.20 --capacity-asof 2026-06-24 --backup-out backup_funds.csv
 #     后续同一数据截面重算权重时，复用评分文件，无需再次对全池拉取/评分：
 python -m fof_system.run_portfolio --source akshare --pit-root /data/fof_pit \
     --universe-asof 2026-06-23 --end 2026-06-23 \
@@ -195,6 +199,25 @@ python -m fof_system.run_capacity --pit-root /data/fof_pit --asof 2026-06-24 \
 # 用iFinD THS_HQ写入ETF成交额（代码需带交易所后缀）
 python -m fof_system.run_data --root /data/fof_pit ingest-etf --source ifind_http \
     --codes 589990.SH --start 2025-06-24 --end 2026-06-24
+
+# 0g) 批量补齐股票ETF全池成交额PIT：自动从PIT主数据中筛选
+#     AUM≥5亿元、非QDII、明确股票ETF标签的产品；支持 AkShare 兜底或 iFinD HTTP。
+python -m fof_system.run_data --root /data/fof_pit ingest-etf-pool --source akshare \
+    --universe-asof 2026-06-23 --start 2025-06-24 --end 2026-06-24 \
+    --skip-existing --codes-out stock_etf_pool.csv
+
+# 0h) 用渠道/供应商CSV补主数据字段，例如 manager_start、单日申购限额字段等。
+#     该命令不会改写旧快照，而是在 available-at 日期生成一份新的PIT补丁快照。
+python -m fof_system.run_data --root /data/fof_pit patch-universe-fields \
+    --asof 2026-06-23 --patch-csv manager_start_patch.csv \
+    --source channel:manager-tenure --available-at 2026-06-25
+
+# 0i) 交易日前校验：正式下单前优先使用渠道/TA当日CSV；缺少限额字段默认失败。
+python -m fof_system.run_pretrade_check \
+    --portfolio-csv full_eligible_open_subscription_20pct_capacity_portfolio.csv \
+    --backup-csv full_eligible_open_subscription_20pct_capacity_backups.csv \
+    --status-source csv --status-csv channel_pretrade_status.csv \
+    --asof 2026-06-25 --report-out pretrade_report.csv --summary-out pretrade_summary.json
 ```
 
 > **配置 iFinD 密钥**：编辑 `ifind-finance-data` skill 目录下的 `mcp_config.json`，

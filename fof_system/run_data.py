@@ -40,6 +40,30 @@ def _codes(value: str) -> list[str]:
     return codes
 
 
+def _with_exchange_suffix(code: str) -> str:
+    """iFinD THS_HQ 通常要求交易所后缀；PIT主键仍保持六码。"""
+    raw = str(code).strip().split(".", 1)[0].zfill(6)
+    if raw.startswith(("5", "6")):
+        return f"{raw}.SH"
+    return f"{raw}.SZ"
+
+
+def _truthy(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.lower().isin(("1", "true", "yes", "y", "是"))
+
+
+def _stock_etf_pool_from_pit(store: PITDataStore, asof: str | pd.Timestamp) -> pd.DataFrame:
+    universe = store.read_universe_asof(asof, asset_types=("etf",), active_only=True)
+    if universe.empty:
+        return universe
+    is_stock_etf = _truthy(universe.get("is_stock_etf", pd.Series(False, index=universe.index)))
+    is_qdii = _truthy(universe.get("is_qdii", pd.Series(False, index=universe.index)))
+    aum = pd.to_numeric(universe.get("aum_yi", pd.Series(float("nan"), index=universe.index)), errors="coerce")
+    pool = universe.loc[is_stock_etf & ~is_qdii & aum.ge(5.0)].copy()
+    pool["code"] = pool["code"].astype(str).str.strip().str.zfill(6)
+    return pool.sort_values("code").reset_index(drop=True)
+
+
 def _p04955_frame_with_quarantine(raw: pd.DataFrame, asof: str | pd.Timestamp,
                                   store: PITDataStore) -> tuple[pd.DataFrame, dict]:
     frame, quarantined = p04955_pit_frame(raw, asof)
@@ -122,6 +146,28 @@ def main(argv: list[str] | None = None) -> int:
     etf.add_argument("--available-at", default="",
                      help="统一可得日期；留空则按交易日后一天的保守假设")
     etf.add_argument("--availability-lag-days", type=int, default=1)
+
+    etf_pool = sub.add_parser("ingest-etf-pool", help="从PIT股票ETF池批量写入ETF日行情")
+    etf_pool.add_argument("--source", default="akshare", choices=["akshare", "ifind_http"])
+    etf_pool.add_argument("--universe-asof", required=True, help="股票ETF池的PIT时点")
+    etf_pool.add_argument("--start", required=True)
+    etf_pool.add_argument("--end", default="")
+    etf_pool.add_argument("--available-at", default="",
+                          help="统一可得日期；留空则按交易日后一天的保守假设")
+    etf_pool.add_argument("--availability-lag-days", type=int, default=1)
+    etf_pool.add_argument("--skip-existing", action="store_true",
+                          help="若该ETF在asof已存在覆盖到end的行情，则跳过")
+    etf_pool.add_argument("--max-codes", type=int, default=0,
+                          help="仅处理前N只，用于测试/分批；0表示全池")
+    etf_pool.add_argument("--codes-out", default="", help="保存本次识别出的股票ETF池代码")
+
+    patch_universe = sub.add_parser("patch-universe-fields", help="用CSV补丁更新当前PIT主数据字段并写入新快照")
+    patch_universe.add_argument("--asof", required=True, help="读取该时点可见主数据作为底表")
+    patch_universe.add_argument("--patch-csv", required=True, help="至少含 code 列；可含 manager_start、限额字段等")
+    patch_universe.add_argument("--source", required=True)
+    patch_universe.add_argument("--available-at", required=True)
+    patch_universe.add_argument("--effective-date", default="", help="默认等于 available-at")
+    patch_universe.add_argument("--source-asof", default="", help="补丁数据业务日期")
 
     args = parser.parse_args(argv)
     store = PITDataStore(args.root)
@@ -252,6 +298,89 @@ def main(argv: list[str] | None = None) -> int:
         print(f"已导入PIT持仓：{write.path}（{write.rows} 行）")
         print(f"manifest：{write.manifest_path}")
         return 0
+
+    if args.command == "patch-universe-fields":
+        base = store.read_universe_asof(args.asof, active_only=False)
+        if base.empty:
+            parser.error(f"{args.asof} 没有可用PIT主数据，无法应用补丁")
+        patch = pd.read_csv(args.patch_csv, dtype={"code": "string"})
+        if "code" not in patch:
+            parser.error("patch-csv 缺少 code 列")
+        patch = patch.copy()
+        patch["code"] = patch["code"].astype(str).str.strip().str.replace(
+            r"\.(?:OF|SH|SZ|BJ)$", "", regex=True, case=False,
+        ).str.zfill(6)
+        if patch["code"].duplicated().any():
+            parser.error("patch-csv 中 code 不得重复")
+        merged = base.set_index(base["code"].astype(str)).copy()
+        patch = patch.set_index("code")
+        overlap = sorted(set(merged.index) & set(patch.index))
+        if not overlap:
+            parser.error("patch-csv 中没有任何 code 命中当前PIT主数据")
+        for column in patch.columns:
+            merged.loc[overlap, column] = patch.loc[overlap, column]
+        write = store.write_universe_snapshot(
+            merged.reset_index(drop=True),
+            source=args.source,
+            available_at=args.available_at,
+            effective_date=args.effective_date or None,
+            source_asof=args.source_asof or args.asof,
+            source_metadata={"patch_rows": int(len(patch)), "matched_rows": int(len(overlap))},
+        )
+        print(f"已写入主数据补丁快照：{write.path}（{write.rows} 行，命中 {len(overlap)} 条补丁）")
+        print(f"manifest：{write.manifest_path}")
+        return 0
+
+    if args.command == "ingest-etf-pool":
+        pool = _stock_etf_pool_from_pit(store, args.universe_asof)
+        if pool.empty:
+            parser.error("PIT主数据中没有满足 AUM≥5亿、非QDII、股票ETF 标签的产品")
+        if args.codes_out:
+            pool[["code", "name", "aum_yi"]].to_csv(args.codes_out, index=False, encoding="utf-8-sig")
+            print(f"股票ETF池代码已写入：{args.codes_out}（{len(pool)} 只）")
+        if args.max_codes and args.max_codes > 0:
+            pool = pool.head(args.max_codes).copy()
+        provider_kwargs = {}
+        if args.source == "ifind_http":
+            provider_kwargs["cache_dir"] = store.root / "raw" / "ifind_http"
+        provider = get_provider(args.source, **provider_kwargs)
+        end = args.end or pd.Timestamp.today().strftime("%Y-%m-%d")
+        skip_asof = args.available_at or (
+            pd.Timestamp(end) + pd.Timedelta(days=args.availability_lag_days)
+        ).strftime("%Y-%m-%d")
+        written = 0
+        skipped = 0
+        failed: list[tuple[str, str]] = []
+        for row in pool.itertuples(index=False):
+            code = str(row.code).zfill(6)
+            if args.skip_existing:
+                existing = store.read_market_asof(code, skip_asof, start=args.start)
+                if not existing.empty and pd.to_datetime(existing["trading_date"]).max() >= pd.Timestamp(end):
+                    skipped += 1
+                    continue
+            request_code = _with_exchange_suffix(code) if args.source == "ifind_http" else code
+            try:
+                market = provider_etf_market(provider, request_code, args.start, end)
+                # 供应商请求可带交易所后缀，但 PIT 主键必须保持六码。
+                market["code"] = code
+                write = store.write_market_data(
+                    market, source=f"{args.source}:etf", available_at=args.available_at or None,
+                    availability_lag_days=args.availability_lag_days,
+                    source_metadata=market.attrs.get("ifind_request") if args.source == "ifind_http" else None,
+                )
+                written += 1
+                print(f"{code}: 已写入 {write.rows} 行 → {write.path}")
+            except Exception as exc:  # noqa: BLE001 - 批量入库要保留失败清单继续跑
+                failed.append((code, str(exc)[:300]))
+                print(f"⚠ {code}: 写入失败：{str(exc)[:180]}")
+        print(f"ETF批量入库完成：写入 {written}，跳过 {skipped}，失败 {len(failed)}，候选池 {len(pool)}")
+        if failed:
+            fail_path = store.root / "quarantine" / "etf_market_failures"
+            fail_path.mkdir(parents=True, exist_ok=True)
+            path = fail_path / f"asof={pd.Timestamp(args.universe_asof).strftime('%Y-%m-%d')}_{args.source}.csv"
+            pd.DataFrame(failed, columns=["code", "error"]).to_csv(path, index=False, encoding="utf-8-sig")
+            print(f"失败清单已写入：{path}")
+        return 1 if failed else 0
 
     provider_kwargs = {}
     if args.source == "ifind_http":

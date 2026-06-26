@@ -25,6 +25,9 @@ BENCHMARK_WEIGHTS: dict[str, float] = {
     "value": 0.3,
 }
 
+# 当前FOF组合规模（亿元）。用于把产品容量、ETF成交额参与率转换为优化器可执行的权重上限。
+PORTFOLIO_AUM_YI: float = 14.0
+
 # 年化无风险利率（用于夏普/超额计算的基线）。可改为按期取国债收益率。
 RISK_FREE_ANNUAL: float = 0.018
 
@@ -139,14 +142,18 @@ STYLE_TIMING = StyleTimingConfig()
 # ---------------------------------------------------------------------------
 @dataclass
 class OptimizerConfig:
-    # 进入优化的主动基金候选数（从严格合规全池评分中选取，保证 SLSQP 稳定）
-    n_candidates: int = 15
+    # 进入优化的主动基金候选数。容量约束下，小规模低成长基金未必能承担足够权重，
+    # 因此保留更宽候选集，避免风格目标因容量被动失配。
+    n_candidates: int = 20
     # 全池候选中至少保留的“风格补全”主动基金数：当期目标低于候选主风格时，
     # 从成长载荷显著更低的一侧按综合分补入，避免被迫使用低流动性ETF补风格。
-    style_complement_candidates: int = 4
+    style_complement_candidates: int = 6
     style_complement_gap: float = 0.15
     # 单只基金权重上限（分散度约束）
     max_weight_fund: float = 0.10
+    # 单笔主动基金申购金额不得超过该基金最新规模的比例。该约束与单基金权重上限
+    # 共同生效；例如14亿元FOF买入1.4亿元时，标的基金规模至少应为7亿元。
+    max_order_to_fund_aum: float = 0.20
     # 单只基金权重下限（>0 时为"要么不买、要么至少买这么多"，这里用 0 简化）
     min_weight_fund: float = 0.0
     # 风险厌恶系数 γ：目标 max αᵀx − γ·xᵀΣx。越大越保守（越压低特质风险）。

@@ -22,7 +22,7 @@ import pandas as pd
 
 from .data import get_provider
 from .data.pit import PITDataStore
-from .engine.capacity import etf_capacity_weight_caps
+from .engine.capacity import active_fund_capacity_weight_caps, etf_capacity_weight_caps
 from .engine.universe import filter_universe
 from .pipeline import score_universe
 from .portfolio import (
@@ -57,8 +57,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--pit-root", default="", help="PIT数据仓；用于识别实际ETF与PIT主数据")
     p.add_argument("--universe-asof", default="", help="PIT元数据时点，默认评价截止日")
     p.add_argument("--cache-dir", default="", help="akshare净值/指数本地缓存目录；全池运行默认写入PIT raw目录")
-    p.add_argument("--portfolio-aum-yi", type=float, default=None,
-                   help="FOF规模（亿元）；与--pit-root联用时按ETF近20日成交额施加单日容量上限")
+    p.add_argument("--portfolio-aum-yi", type=float, default=config.PORTFOLIO_AUM_YI,
+                   help="FOF规模（亿元）；默认14亿元。与--pit-root联用时施加主动基金和ETF容量上限")
+    p.add_argument("--max-order-to-fund-aum", type=float, default=config.OPTIMIZER.max_order_to_fund_aum,
+                   help="主动基金单笔申购/基金规模上限，默认20%%")
     p.add_argument("--capacity-asof", default="",
                    help="ETF成交额在该PIT时点可见；默认与universe-asof相同")
     p.add_argument("--etf-participation-rate", type=float, default=0.10,
@@ -147,23 +149,35 @@ def main(argv: list[str] | None = None) -> int:
     # 对真实ETF（不是研究用合成ETF）施加可交易容量上限。PIT行情缺失时上限为零，
     # 使优化器选择主动基金或明确报告风格不可达，而不是输出不可执行的ETF仓位。
     max_weight_by_code = None
-    if args.portfolio_aum_yi is not None:
-        if not args.pit_root:
-            p.error("--portfolio-aum-yi 需要与--pit-root联用，才能审计ETF成交额。")
+    if args.portfolio_aum_yi is not None and args.pit_root:
         if args.portfolio_aum_yi <= 0:
             p.error("--portfolio-aum-yi 必须为正数。")
+        if not 0 < args.max_order_to_fund_aum <= 1:
+            p.error("--max-order-to-fund-aum 必须在 (0, 1] 内。")
         etf_codes = [code for code in codes if str(asset_metadata.get(str(code), {}).get("asset_type", "")).lower() == "etf"
                      or str(asset_metadata.get(str(code), {}).get("is_stock_etf", "")).lower() in ("1", "true", "yes", "y", "是")]
+        active_fund_codes = [code for code in codes if code not in set(etf_codes)]
+        fund_caps = active_fund_capacity_weight_caps(
+            active_fund_codes, asset_metadata, portfolio_aum_yi=args.portfolio_aum_yi,
+            max_order_to_fund_aum=args.max_order_to_fund_aum,
+        )
         market_asof = args.capacity_asof or asof
         frames = [PITDataStore(args.pit_root).read_market_asof(code, market_asof) for code in etf_codes]
         market = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        max_weight_by_code = etf_capacity_weight_caps(
+        etf_caps = etf_capacity_weight_caps(
             market, etf_codes, portfolio_aum_yi=args.portfolio_aum_yi,
             participation_rate=args.etf_participation_rate, lookback=args.etf_adv_lookback,
         )
+        max_weight_by_code = pd.concat([fund_caps, etf_caps])
+        if active_fund_codes:
+            tightest = ", ".join(f"{code}≤{cap:.1%}" for code, cap in fund_caps.sort_values().head(5).items())
+            print(f"主动基金容量上限（订单/基金规模≤{args.max_order_to_fund_aum:.0%}）：最紧约束 {tightest}")
         if etf_codes:
-            caps = ", ".join(f"{code}≤{cap:.1%}" for code, cap in max_weight_by_code.items())
+            caps = ", ".join(f"{code}≤{cap:.1%}" for code, cap in etf_caps.items())
             print(f"ETF单日容量上限（{args.portfolio_aum_yi:.2f}亿元、参与率{args.etf_participation_rate:.0%}、{args.etf_adv_lookback}日ADV）：{caps}")
+    elif args.portfolio_aum_yi is not None and args.source != "mock":
+        if not args.pit_root:
+            p.error("--portfolio-aum-yi 需要与--pit-root联用，才能审计ETF成交额。")
 
     # 目标成长暴露
     if args.target_growth is not None:
@@ -230,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             "capacity": {
                 "portfolio_aum_yi": args.portfolio_aum_yi,
+                "max_order_to_fund_aum": args.max_order_to_fund_aum if args.portfolio_aum_yi is not None else None,
                 "participation_rate": args.etf_participation_rate if args.portfolio_aum_yi is not None else None,
                 "adv_lookback": args.etf_adv_lookback if args.portfolio_aum_yi is not None else None,
                 "asof": (args.capacity_asof or asof) if args.portfolio_aum_yi is not None else None,

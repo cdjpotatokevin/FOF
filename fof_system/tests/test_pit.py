@@ -6,6 +6,7 @@ from fof_system.data import PITDataError, PITDataStore
 from fof_system.data import get_provider
 from fof_system.engine.universe import filter_universe
 from fof_system.pipeline import score_universe
+from fof_system.run_data import _stock_etf_pool_from_pit
 
 
 def test_universe_reads_only_records_available_at_asof(tmp_path):
@@ -95,6 +96,9 @@ def test_strict_investment_universe_applies_fund_and_stock_etf_thresholds():
          "aum_yi": 10.0, "inception": "2024-08-01", "subscription_status": "开放申购"},
         {"code": "F_PAUSED", "name": "暂停申购主动", "asset_type": "fund", "fund_type": "股票型",
          "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "暂停大额申购"},
+        {"code": "F_LIMITED", "name": "限额主动", "asset_type": "fund", "fund_type": "股票型",
+         "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "开放申购",
+         "daily_subscription_limit_yi": 0.1},
         {"code": "E_OK", "name": "股票ETF", "asset_type": "etf", "fund_type": "ETF",
          "is_stock_etf": True, "is_qdii": False, "aum_yi": 5.0, "inception": "2024-01-01"},
         {"code": "E_SMALL", "name": "小ETF", "asset_type": "etf", "fund_type": "ETF",
@@ -131,3 +135,22 @@ def test_scoring_uses_pit_aum_instead_of_current_provider_metadata(tmp_path):
         pit_store=store, universe_asof="2024-09-30",
     )
     assert set(scored["size_yi"]) == {12.3}
+
+
+def test_stock_etf_pool_from_pit_requires_stock_label_non_qdii_and_size(tmp_path):
+    store = PITDataStore(tmp_path / "pit")
+    snapshot = pd.DataFrame([
+        {"code": "159001", "name": "股票ETF", "asset_type": "etf", "fund_type": "ETF",
+         "is_stock_etf": True, "is_qdii": False, "aum_yi": 5.0},
+        {"code": "159002", "name": "小ETF", "asset_type": "etf", "fund_type": "ETF",
+         "is_stock_etf": True, "is_qdii": False, "aum_yi": 4.99},
+        {"code": "159003", "name": "QDII ETF", "asset_type": "etf", "fund_type": "ETF",
+         "is_stock_etf": True, "is_qdii": True, "aum_yi": 20.0},
+        {"code": "159004", "name": "非股票ETF", "asset_type": "etf", "fund_type": "ETF",
+         "is_stock_etf": False, "is_qdii": False, "aum_yi": 20.0},
+    ])
+    store.write_universe_snapshot(snapshot, source="vendor", available_at="2026-06-25")
+
+    pool = _stock_etf_pool_from_pit(store, "2026-06-25")
+
+    assert pool["code"].tolist() == ["159001"]

@@ -18,8 +18,14 @@ def _subscription_open(df: pd.DataFrame) -> pd.Series:
     """
     status = df.get("subscription_status", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
     opening = status.str.contains(r"开放(?:大额)?申购", regex=True, na=False)
-    blocked = status.str.contains(r"暂停|封闭|限额|限制", regex=True, na=False)
-    return opening & ~blocked
+    blocked = status.str.contains(r"暂停|封闭|限额|限购|限制", regex=True, na=False)
+    # 供应商若显式提供单日限额/限购标志或金额，任何非空限额均视为不可申购。
+    explicit_limit = _bool_col(df, "has_daily_subscription_limit")
+    if "daily_subscription_limit_yi" in df:
+        explicit_limit = explicit_limit | pd.to_numeric(
+            df["daily_subscription_limit_yi"], errors="coerce"
+        ).notna()
+    return opening & ~blocked & ~explicit_limit
 
 
 def filter_universe(
