@@ -1,10 +1,13 @@
 """第①层PIT数据合同测试。"""
+from dataclasses import replace
+
 import pandas as pd
 import pytest
 
+from fof_system.config import DEFAULT_FILTER
 from fof_system.data import PITDataError, PITDataStore
 from fof_system.data import get_provider
-from fof_system.engine.universe import filter_universe
+from fof_system.engine.universe import filter_universe, management_company_allowed
 from fof_system.pipeline import score_universe
 from fof_system.run_data import _stock_etf_pool_from_pit
 
@@ -96,7 +99,9 @@ def test_strict_investment_universe_applies_fund_and_stock_etf_thresholds():
          "aum_yi": 10.0, "inception": "2024-08-01", "subscription_status": "开放申购"},
         {"code": "F_PAUSED", "name": "暂停申购主动", "asset_type": "fund", "fund_type": "股票型",
          "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "暂停大额申购"},
-        {"code": "F_LIMITED", "name": "限额主动", "asset_type": "fund", "fund_type": "股票型",
+        {"code": "F_LIMITED", "name": "限大额主动", "asset_type": "fund", "fund_type": "股票型",
+         "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "限大额"},
+        {"code": "F_DAILY", "name": "单日限额主动", "asset_type": "fund", "fund_type": "股票型",
          "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "开放申购",
          "daily_subscription_limit_yi": 0.1},
         {"code": "E_OK", "name": "股票ETF", "asset_type": "etf", "fund_type": "ETF",
@@ -106,8 +111,49 @@ def test_strict_investment_universe_applies_fund_and_stock_etf_thresholds():
         {"code": "E_QDII", "name": "海外ETF", "asset_type": "etf", "fund_type": "ETF QDII",
          "is_stock_etf": True, "is_qdii": True, "aum_yi": 20.0, "inception": "2020-01-01"},
     ])
-    filtered = filter_universe(universe, asof="2025-07-31", strict_eligibility=True)
+    filtered = filter_universe(
+        universe, asof="2025-07-31", strict_eligibility=True,
+        flt=replace(DEFAULT_FILTER, allowed_management_companies=[], require_manager_tenure=False),
+    )
     assert set(filtered["code"]) == {"F_OK", "E_OK"}
+
+
+def test_management_company_whitelist():
+    assert management_company_allowed("易方达基金管理有限公司", ["易方达基金"])
+    assert not management_company_allowed("财通基金管理有限公司", ["易方达基金"])
+    assert management_company_allowed("中银国际证券股份有限公司", ["中银国际证券", "中银基金"])
+    assert management_company_allowed("中银基金管理有限公司", ["中银国际证券", "中银基金"])
+    assert not management_company_allowed("上海国泰海通证券资产管理有限公司", ["国泰基金"])
+
+    universe = pd.DataFrame([
+        {"code": "F_YFD", "name": "易方达产品", "asset_type": "fund", "fund_type": "股票型",
+         "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "开放申购",
+         "management_company": "易方达基金管理有限公司", "manager_start": "2020-01-01"},
+        {"code": "F_CT", "name": "财通产品", "asset_type": "fund", "fund_type": "股票型",
+         "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "开放申购",
+         "management_company": "财通基金管理有限公司", "manager_start": "2020-01-01"},
+        {"code": "F_NEW_MGR", "name": "新经理产品", "asset_type": "fund", "fund_type": "股票型",
+         "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "开放申购",
+         "management_company": "易方达基金管理有限公司", "manager_start": "2025-01-01"},
+        {"code": "E_YFD", "name": "易方达ETF", "asset_type": "etf", "fund_type": "ETF",
+         "is_stock_etf": True, "is_qdii": False, "aum_yi": 10.0, "inception": "2020-01-01",
+         "management_company": "易方达基金管理有限公司"},
+    ])
+    filtered = filter_universe(universe, asof="2025-07-31", strict_eligibility=True)
+    assert set(filtered["code"]) == {"F_YFD", "E_YFD"}
+
+
+def test_manager_tenure_requires_one_year_on_fund():
+    universe = pd.DataFrame([
+        {"code": "F_OK", "name": "老经理", "asset_type": "fund", "fund_type": "股票型",
+         "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "开放申购",
+         "management_company": "易方达基金管理有限公司", "manager_start": "2020-01-01"},
+        {"code": "F_NEW", "name": "新经理", "asset_type": "fund", "fund_type": "股票型",
+         "aum_yi": 10.0, "inception": "2020-01-01", "subscription_status": "开放申购",
+         "management_company": "易方达基金管理有限公司", "manager_start": "2025-01-01"},
+    ])
+    filtered = filter_universe(universe, asof="2025-07-31", strict_eligibility=True)
+    assert set(filtered["code"]) == {"F_OK"}
 
 
 def test_universe_excludes_passive_index_fund_and_stock_fof_but_keeps_labeled_etf():
@@ -128,6 +174,7 @@ def test_scoring_uses_pit_aum_instead_of_current_provider_metadata(tmp_path):
     store = PITDataStore(tmp_path / "pit")
     snapshot = provider.list_funds().assign(
         asset_type="fund", aum_yi=12.3, manager_start="2020-01-01", subscription_status="开放申购",
+        management_company="易方达基金管理有限公司",
     )
     store.write_universe_snapshot(snapshot, source="mock", available_at="2024-09-30")
     scored = score_universe(

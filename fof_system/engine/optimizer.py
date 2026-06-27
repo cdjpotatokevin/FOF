@@ -47,6 +47,8 @@ def optimize_portfolio(
     etf_total_cap: float = 0.40,
     te_budget_annual: float | None = None,
     max_weight_by_code: Mapping[str, float] | None = None,
+    min_weight_by_code: Mapping[str, float] | None = None,
+    weight_budget: float = 1.0,
     style_penalty: float = 5e3,
     style_tolerance: float = 1e-3,
 ) -> OptResult:
@@ -59,13 +61,17 @@ def optimize_portfolio(
 
     # 边界：基金 [min,max]，ETF [0, etf_cap]；容量或合规产生的逐代码上限可进一步收紧。
     cap_source = max_weight_by_code if max_weight_by_code is not None else {}
+    floor_source = min_weight_by_code if min_weight_by_code is not None else {}
     code_caps = {str(code): float(cap) for code, cap in cap_source.items()}
+    code_floors = {str(code): float(floor) for code, floor in floor_source.items()}
     bounds = []
     for i, code in enumerate(codes):
         lower, upper = (0.0, etf_total_cap) if is_etf[i] else (min_weight_fund, max_weight_fund)
+        if str(code) in code_floors:
+            lower = max(lower, max(0.0, code_floors[str(code)]))
         if str(code) in code_caps:
             upper = min(upper, max(0.0, code_caps[str(code)]))
-        if upper < lower:
+        if upper < lower - 1e-12:
             raise ValueError(f"{code} 的逐代码上限低于最小持仓约束。")
         bounds.append((lower, upper))
 
@@ -73,7 +79,10 @@ def optimize_portfolio(
     # 避免等式约束共线导致 SLSQP 失败，但不能因此把不可达的目标伪装成已命中。
     A_ub = [is_etf.astype(float)] if etf_codes else None
     b_ub = [etf_total_cap] if etf_codes else None
-    lp_args = dict(A_ub=A_ub, b_ub=b_ub, A_eq=[np.ones(n)], b_eq=[1.0], bounds=bounds, method="highs")
+    budget = float(weight_budget)
+    if not (0.0 < budget <= 1.0 + 1e-9):
+        raise ValueError(f"weight_budget 须在 (0, 1] 内，收到 {budget}")
+    lp_args = dict(A_ub=A_ub, b_ub=b_ub, A_eq=[np.ones(n)], b_eq=[budget], bounds=bounds, method="highs")
     # 先确认“满仓”本身可行。若主动基金数量不足以填满非ETF仓位，且ETF总上限又较低，
     # SLSQP 可能返回违反约束的失败解；此时绝不能把该权重展示为可交易组合。
     base_lp = linprog(np.zeros(n), **lp_args)
@@ -101,7 +110,7 @@ def optimize_portfolio(
 
     # 仅保留"和为1"硬等式，杜绝共线
     cons = [
-        {"type": "eq", "fun": lambda x: x.sum() - 1.0, "jac": lambda x: np.ones(n)},
+        {"type": "eq", "fun": lambda x: x.sum() - budget, "jac": lambda x: np.ones(n)},
     ]
     if etf_codes:
         cons.append({"type": "ineq",  # etf_cap - Σx_etf ≥ 0
@@ -120,7 +129,7 @@ def optimize_portfolio(
 
     # 数值求解失败时回退到显式可行的线性规划解；不把越界的失败迭代点伪装成投资组合。
     x = np.clip(res.x, 0, None) if res.success else x0
-    x = x / x.sum() if x.sum() > 0 else x0
+    x = x / x.sum() * budget if x.sum() > 0 else x0
     w = pd.Series(x, index=codes)
     w = w[w > 1e-4].sort_values(ascending=False)  # 去掉极小权重
 

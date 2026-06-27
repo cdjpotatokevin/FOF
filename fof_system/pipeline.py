@@ -4,6 +4,10 @@
 """
 from __future__ import annotations
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any
+
+import numpy as np
 import pandas as pd
 
 from . import config
@@ -11,7 +15,7 @@ from .data import get_provider, DataProvider
 from .data.pit import PITDataStore
 from .engine.rbsa import run_rbsa
 from .engine.metrics import compute_metrics, FundMetrics
-from .engine.scoring import score_funds, explain_top
+from .engine.scoring import score_funds
 
 log = logging.getLogger("fof")
 
@@ -47,6 +51,7 @@ def score_one_fund(
     start: str,
     end: str,
     pit_meta: dict | None = None,
+    skip_rolling: bool = False,
 ) -> FundMetrics | None:
     freq = config.RETURN_FREQ
     ppy = config.PERIODS_PER_YEAR[freq]
@@ -95,7 +100,102 @@ def score_one_fund(
         bench_growth_weight=config.BENCHMARK_WEIGHTS["growth"],
         size_yi=size_yi, size_sweet=config.SIZE_SWEET_SPOT_YI,
         tenure_years=tenure,
+        skip_rolling=skip_rolling,
     )
+
+
+def _lite_prescreen_score(row: dict) -> float:
+    """粗筛排序：风格调整后 alpha × R² + IR，用于缩小全池精评范围。"""
+    alpha = pd.to_numeric(row.get("style_alpha_ann"), errors="coerce")
+    r2 = pd.to_numeric(row.get("style_r2"), errors="coerce")
+    ir = pd.to_numeric(row.get("info_ratio"), errors="coerce")
+    if not np.isfinite(alpha):
+        alpha = 0.0
+    if not np.isfinite(r2):
+        r2 = 0.0
+    if not np.isfinite(ir):
+        ir = 0.0
+    return float(alpha * np.clip(r2, 0.0, 1.0) * 0.65 + ir * 0.35)
+
+
+def _score_record_task(task: dict[str, Any]) -> dict | None:
+    """进程池 worker：在子进程内重建 provider 并评价单只基金。"""
+    provider = get_provider(task["provider_name"], **task.get("provider_kwargs", {}))
+    m = score_one_fund(
+        provider,
+        task["code"],
+        task.get("name", ""),
+        task["factor_df"],
+        task["bench"],
+        task["start"],
+        task["end"],
+        pit_meta=task.get("pit_meta"),
+        skip_rolling=task.get("skip_rolling", False),
+    )
+    if m is None:
+        return None
+    d = m.as_dict()
+    for key in ("fund_type", "asset_type", "is_stock_etf", "is_qdii"):
+        if key in task:
+            d[key] = task[key]
+    return d
+
+
+def _score_records(
+    provider: DataProvider,
+    records: list[dict],
+    *,
+    records_are_pit: bool,
+    factor_df: pd.DataFrame,
+    bench: pd.Series,
+    start: str,
+    end: str,
+    skip_rolling: bool,
+    workers: int,
+    provider_name: str,
+    provider_kwargs: dict | None,
+) -> list[dict]:
+    tasks: list[dict[str, Any]] = []
+    for rec in records:
+        use_pit_meta = records_are_pit or bool(rec.get("_pit_meta"))
+        tasks.append({
+            "provider_name": provider_name,
+            "provider_kwargs": provider_kwargs or {},
+            "code": rec["code"],
+            "name": rec.get("name", ""),
+            "factor_df": factor_df,
+            "bench": bench,
+            "start": start,
+            "end": end,
+            "pit_meta": rec if use_pit_meta else None,
+            "skip_rolling": skip_rolling,
+            "fund_type": rec.get("fund_type", ""),
+            "asset_type": rec.get("asset_type", "fund"),
+            "is_stock_etf": rec.get("is_stock_etf", False),
+            "is_qdii": rec.get("is_qdii", False),
+        })
+
+    rows: list[dict] = []
+    total = len(tasks)
+    if workers > 1 and total > 1:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_score_record_task, task): i for i, task in enumerate(tasks, 1)}
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                result = future.result()
+                if result is not None:
+                    rows.append(result)
+                if done % 25 == 0 or done == total:
+                    log.info("已处理 %d/%d", done, total)
+    else:
+        for i, task in enumerate(tasks, 1):
+            result = _score_record_task(task)
+            if result is not None:
+                rows.append(result)
+            if i % 25 == 0:
+                log.info("已处理 %d/%d", i, total)
+    return rows
 
 
 def score_universe(
@@ -107,6 +207,12 @@ def score_universe(
     limit: int | None = None,
     pit_store: PITDataStore | None = None,
     universe_asof: str | None = None,
+    strict_eligibility: bool | None = None,
+    skip_rolling: bool = False,
+    preselect_pool: int | None = None,
+    workers: int = 1,
+    provider_name: str | None = None,
+    provider_kwargs: dict | None = None,
 ) -> pd.DataFrame:
     """对一批基金打分并排名。
 
@@ -128,10 +234,18 @@ def score_universe(
                 uni = uni[~qdii]
         else:
             uni = provider.list_funds()
-        uni = filter_universe(
-            uni, asof=pit_asof if pit_store is not None else None,
-            strict_eligibility=pit_store is not None,
-        )
+        use_strict = pit_store is not None if strict_eligibility is None else strict_eligibility
+        if use_strict and pit_store is not None:
+            from .engine.manager_tenure import filter_strict_universe
+            uni = filter_strict_universe(
+                uni, asof=pit_asof,
+                cache_dir=pit_store.root / "raw" / "eastmoney",
+            )
+        else:
+            uni = filter_universe(
+                uni, asof=pit_asof if pit_store is not None else None,
+                strict_eligibility=use_strict,
+            )
         records = uni.to_dict("records")
         records_are_pit = pit_store is not None
     else:
@@ -162,26 +276,36 @@ def score_universe(
     if limit:
         records = records[:limit]
 
-    rows: list[dict] = []
-    for i, rec in enumerate(records, 1):
-        use_pit_meta = records_are_pit or bool(rec.get("_pit_meta"))
-        m = score_one_fund(provider, rec["code"], rec.get("name", ""),
-                           factor_df, bench, start, end,
-                           pit_meta=rec if use_pit_meta else None)
-        if m is not None:
-            d = m.as_dict()
-            d["fund_type"] = rec.get("fund_type", "")
-            d["asset_type"] = rec.get("asset_type", "fund")
-            d["is_stock_etf"] = rec.get("is_stock_etf", False)
-            d["is_qdii"] = rec.get("is_qdii", False)
-            rows.append(d)
-        if i % 25 == 0:
-            log.info("已处理 %d/%d", i, len(records))
+    pname = provider_name or _provider_label(provider)
+    rows = _score_records(
+        provider, records, records_are_pit=records_are_pit,
+        factor_df=factor_df, bench=bench, start=start, end=end,
+        skip_rolling=skip_rolling, workers=workers,
+        provider_name=pname, provider_kwargs=provider_kwargs,
+    )
 
     if not rows:
         raise RuntimeError("没有任何基金通过评价（检查数据源/代码/窗口）。")
 
     metrics_df = pd.DataFrame(rows)
+    if preselect_pool and len(metrics_df) > preselect_pool:
+        metrics_df["_lite_score"] = metrics_df.apply(_lite_prescreen_score, axis=1)
+        metrics_df = metrics_df.sort_values(
+            ["_lite_score", "style_alpha_ann", "info_ratio", "code"],
+            ascending=[False, False, False, True],
+        ).head(preselect_pool).drop(columns="_lite_score")
+        log.info("粗筛保留 %d / %d 只进入综合打分", len(metrics_df), len(rows))
+
     group_col = "fund_type" if (group_by_type and metrics_df["fund_type"].nunique() > 1) else None
     scored = score_funds(metrics_df, group_col=group_col)
     return scored
+
+
+def _provider_label(provider: DataProvider) -> str:
+    mapping = {
+        "MockProvider": "mock",
+        "AkshareProvider": "akshare",
+        "IFinDProvider": "ifind",
+        "IFindHTTPProvider": "ifind_http",
+    }
+    return mapping.get(type(provider).__name__, "akshare")

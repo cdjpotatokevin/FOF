@@ -12,8 +12,8 @@ from typing import Iterable
 import pandas as pd
 
 
-_OPEN_RE = r"开放(?:大额)?申购"
-_BLOCK_RE = r"暂停|封闭|限额|限购|限制"
+from .subscription import SUBSCRIPTION_BLOCK_RE as _BLOCK_RE
+from .subscription import SUBSCRIPTION_OPEN_RE as _OPEN_RE
 _TRUE_VALUES = {"1", "true", "yes", "y", "是", "有"}
 
 

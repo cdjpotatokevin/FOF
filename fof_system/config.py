@@ -90,8 +90,11 @@ class UniverseFilter:
     min_active_equity_size_yi: float = 2.0
     min_stock_etf_size_yi: float = 5.0
     min_track_record_years: float = 1.0
+    # 主动基金现任基金经理须在本基金任职满该年限；缺失任职日不放行。
+    min_manager_tenure_years: float = 1.0
+    require_manager_tenure: bool = True
     # 实盘建仓只允许最新PIT状态为“开放申购”（或“开放大额申购”）的主动基金；
-    # 暂停、限额、封闭及状态缺失均不放行。ETF为交易所交易产品，不适用本字段。
+    # 暂停、限大额、限额/限购/限制、封闭及状态缺失均不放行。ETF为交易所交易产品，不适用本字段。
     require_open_subscription: bool = True
     exclude_keywords: list[str] = field(
         default_factory=lambda: ["持有", "联接", "QDII", "FOF"]  # 范围排除词；QDII同时检查名称与类型
@@ -101,6 +104,14 @@ class UniverseFilter:
     passive_fund_type_keywords: list[str] = field(default_factory=lambda: ["被动指数"])
     # 仅按名称尾部识别份额类别，不能用裸字母 E/C 做子串匹配，否则会误杀 ETF。
     exclude_share_class_suffixes: list[str] = field(default_factory=lambda: ["C", "E", "C类", "E类"])
+    # 允许的管理人（基金公司）短名白名单；strict 模式下产品 management_company 须匹配其一。
+    # 空列表表示不限制。匹配规则见 engine.universe.management_company_allowed。
+    allowed_management_companies: list[str] = field(default_factory=lambda: [
+        "易方达基金", "华宝基金", "华夏基金", "华商基金", "广发基金", "富国基金", "万家基金",
+        "南方基金", "中银国际证券", "嘉实基金", "中信保诚基金", "景顺长城基金", "国泰基金",
+        "招商基金", "鹏华基金", "华安基金", "工银瑞信基金", "华泰柏瑞基金", "永赢基金",
+        "中欧基金", "中银基金", "平安基金", "大成基金",
+    ])
 
 
 DEFAULT_FILTER = UniverseFilter()
@@ -182,7 +193,28 @@ class BacktestConfig:
     # 单边成本：基金申赎费、ETF 佣金/冲击成本的保守简化假设。
     # 实盘和正式回测应按产品费率、持有期及账户佣金覆写，绝不能把 0 成本当成默认真相。
     fund_one_way_cost: float = 0.0015
-    etf_one_way_cost: float = 0.0005
+    etf_one_way_cost: float = 0.0003
+    # 与生产对齐的容量与评分参数（回测 CLI 可覆写）
+    portfolio_aum_yi: float = PORTFOLIO_AUM_YI
+    max_order_to_fund_aum: float = OPTIMIZER.max_order_to_fund_aum
+    etf_participation_rate: float = 0.10
+    etf_adv_lookback: int = 20
+    enforce_active_fund_capacity: bool = False
+    enforce_etf_capacity: bool = False
+    strict_eligibility: bool = False
+    eval_start: str = "2019-01-01"
+    score_cache_dir: str = ""
+    full_universe_scoring: bool = True
+    # 调仓频率：'QE' 季度末（与 PIT 季度快照对齐，推荐）；'ME' 月末
+    rebalance_freq: str = "QE"
+    # 是否预取全区间 PIT 并集净值（极慢）；默认按需加载持仓基金
+    prefetch_all_pit_codes: bool = False
+    # 回测加速：跳过滚动 RBSA（alpha_consistency），每只基金可快 ~100 倍
+    backtest_skip_rolling: bool = True
+    # 全池轻量 RBSA 后仅保留 top-N 进入综合打分（0=不截断）
+    backtest_preselect_pool: int = 400
+    # 评分并行进程数
+    backtest_workers: int = 4
 
 
 BACKTEST = BacktestConfig()

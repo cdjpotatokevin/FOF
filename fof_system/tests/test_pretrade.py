@@ -17,24 +17,25 @@ def test_pretrade_fails_closed_when_limit_evidence_is_missing():
 
 
 def test_pretrade_blocks_status_and_explicit_daily_limit():
-    orders = pd.DataFrame({"code": ["000001", "000002", "000003"]})
+    orders = pd.DataFrame({"code": ["000001", "000002", "000003", "000004"]})
     live = pd.DataFrame({
-        "code": ["000001", "000002", "000003"],
-        "asset_type": ["fund", "fund", "fund"],
-        "subscription_status": ["开放申购", "暂停大额申购", "开放申购"],
-        "daily_subscription_limit_yi": [pd.NA, pd.NA, 0.1],
-        "has_daily_subscription_limit": [False, False, False],
+        "code": ["000001", "000002", "000003", "000004"],
+        "asset_type": ["fund", "fund", "fund", "fund"],
+        "subscription_status": ["开放申购", "暂停大额申购", "限大额", "开放申购"],
+        "daily_subscription_limit_yi": [pd.NA, pd.NA, pd.NA, 0.1],
+        "has_daily_subscription_limit": [False, False, False, False],
     })
 
     report, summary = evaluate_pretrade_status(
         orders, live, asof="2026-06-25", source="csv", require_limit_evidence=True,
     )
 
-    assert summary.failed == 2
+    assert summary.failed == 3
     reasons = dict(zip(report["code"], report["reason"]))
     assert reasons["000001"] == "open_no_limit"
     assert reasons["000002"] == "blocked_subscription_status"
-    assert reasons["000003"] == "daily_subscription_limit_present"
+    assert reasons["000003"] == "blocked_subscription_status"
+    assert reasons["000004"] == "daily_subscription_limit_present"
 
 
 def test_pretrade_marks_etf_as_secondary_market_subscription_not_checked():

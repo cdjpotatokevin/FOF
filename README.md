@@ -214,8 +214,8 @@ python -m fof_system.run_data --root /data/fof_pit patch-universe-fields \
 
 # 0i) 交易日前校验：正式下单前优先使用渠道/TA当日CSV；缺少限额字段默认失败。
 python -m fof_system.run_pretrade_check \
-    --portfolio-csv full_eligible_open_subscription_20pct_capacity_portfolio.csv \
-    --backup-csv full_eligible_open_subscription_20pct_capacity_backups.csv \
+    --portfolio-csv run_outputs/2026-06-25/wanneng2011_overlay_full.csv \
+    --backup-csv run_outputs/2026-06-25/wanneng2011_backups.csv \
     --status-source csv --status-csv channel_pretrade_status.csv \
     --asof 2026-06-25 --report-out pretrade_report.csv --summary-out pretrade_summary.json
 ```

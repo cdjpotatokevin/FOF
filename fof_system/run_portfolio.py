@@ -22,8 +22,9 @@ import pandas as pd
 
 from .data import get_provider
 from .data.pit import PITDataStore
-from .engine.capacity import active_fund_capacity_weight_caps, etf_capacity_weight_caps
-from .engine.universe import filter_universe
+from .rebalance import compute_capacity_caps
+from .engine.manager_tenure import filter_strict_universe
+from .engine.subscription import fetch_akshare_subscription_status, open_subscription_codes_from_frame
 from .pipeline import score_universe
 from .portfolio import (
     build_portfolio, resolve_target_growth, select_backup_candidates,
@@ -67,6 +68,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="单日ETF最大成交额参与率，默认10%%")
     p.add_argument("--etf-adv-lookback", type=int, default=20,
                    help="ETF容量计算的平均成交额回看交易日数，默认20")
+    p.add_argument("--no-live-subscription-check", action="store_true",
+                   help="跳过东方财富实时申购状态校验（默认开启，剔除限大额/暂停等）")
+    p.add_argument("--no-manager-tenure-enrich", action="store_true",
+                   help="跳过东方财富现任经理任职日补全（默认开启）")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -95,9 +100,37 @@ def main(argv: list[str] | None = None) -> int:
     strict_eligible_codes: set[str] | None = None
     if args.pit_root:
         pit_universe = PITDataStore(args.pit_root).read_universe_asof(asof, asset_types=("fund", "etf"))
-        strict_universe = filter_universe(pit_universe, asof=asof, strict_eligibility=True)
-        strict_eligible_codes = set(strict_universe["code"].astype(str))
         asset_metadata = {str(row["code"]): row.to_dict() for _, row in pit_universe.iterrows()}
+        strict_universe = filter_strict_universe(
+            pit_universe, asof=asof,
+            enrich=not args.no_manager_tenure_enrich,
+            cache_dir=PITDataStore(args.pit_root).root / "raw" / "eastmoney",
+        )
+        strict_eligible_codes = set(strict_universe["code"].astype(str))
+        if "manager_start" in strict_universe.columns:
+            tenure_by_code = strict_universe.set_index(strict_universe["code"].astype(str))["manager_start"]
+            for code in asset_metadata:
+                if code in tenure_by_code.index:
+                    value = tenure_by_code.loc[code]
+                    if isinstance(value, pd.Series):
+                        value = value.iloc[-1]
+                    asset_metadata[code]["manager_start"] = value
+        if not args.no_live_subscription_check:
+            live_status = fetch_akshare_subscription_status()
+            live_open_codes = open_subscription_codes_from_frame(live_status)
+            blocked = strict_eligible_codes - live_open_codes
+            if blocked:
+                print(f"实时申购校验：PIT开放但当前不可申购 {len(blocked)} 只，已从候选池剔除。")
+            strict_eligible_codes &= live_open_codes
+            live_by_code = live_status.set_index(live_status["code"].astype(str))
+            for code in list(asset_metadata.keys()):
+                if code in live_by_code.index:
+                    row = live_by_code.loc[code]
+                    if isinstance(row, pd.DataFrame):
+                        row = row.iloc[-1]
+                    asset_metadata[code]["subscription_status"] = row.get("subscription_status", "")
+                    if pd.notna(row.get("daily_subscription_limit_yi", pd.NA)):
+                        asset_metadata[code]["daily_subscription_limit_yi"] = row["daily_subscription_limit_yi"]
 
     codes = [c.strip() for c in args.codes.split(",") if c.strip()]
     inferred_target_growth = None
@@ -154,27 +187,29 @@ def main(argv: list[str] | None = None) -> int:
             p.error("--portfolio-aum-yi 必须为正数。")
         if not 0 < args.max_order_to_fund_aum <= 1:
             p.error("--max-order-to-fund-aum 必须在 (0, 1] 内。")
-        etf_codes = [code for code in codes if str(asset_metadata.get(str(code), {}).get("asset_type", "")).lower() == "etf"
-                     or str(asset_metadata.get(str(code), {}).get("is_stock_etf", "")).lower() in ("1", "true", "yes", "y", "是")]
-        active_fund_codes = [code for code in codes if code not in set(etf_codes)]
-        fund_caps = active_fund_capacity_weight_caps(
-            active_fund_codes, asset_metadata, portfolio_aum_yi=args.portfolio_aum_yi,
+        max_weight_by_code = compute_capacity_caps(
+            codes, asset_metadata,
+            pit_store=PITDataStore(args.pit_root),
+            capacity_asof=args.capacity_asof or asof,
+            portfolio_aum_yi=args.portfolio_aum_yi,
             max_order_to_fund_aum=args.max_order_to_fund_aum,
+            etf_participation_rate=args.etf_participation_rate,
+            etf_adv_lookback=args.etf_adv_lookback,
+            enforce_active_fund_capacity=True,
+            enforce_etf_capacity=True,
         )
-        market_asof = args.capacity_asof or asof
-        frames = [PITDataStore(args.pit_root).read_market_asof(code, market_asof) for code in etf_codes]
-        market = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        etf_caps = etf_capacity_weight_caps(
-            market, etf_codes, portfolio_aum_yi=args.portfolio_aum_yi,
-            participation_rate=args.etf_participation_rate, lookback=args.etf_adv_lookback,
-        )
-        max_weight_by_code = pd.concat([fund_caps, etf_caps])
-        if active_fund_codes:
-            tightest = ", ".join(f"{code}≤{cap:.1%}" for code, cap in fund_caps.sort_values().head(5).items())
-            print(f"主动基金容量上限（订单/基金规模≤{args.max_order_to_fund_aum:.0%}）：最紧约束 {tightest}")
-        if etf_codes:
-            caps = ", ".join(f"{code}≤{cap:.1%}" for code, cap in etf_caps.items())
-            print(f"ETF单日容量上限（{args.portfolio_aum_yi:.2f}亿元、参与率{args.etf_participation_rate:.0%}、{args.etf_adv_lookback}日ADV）：{caps}")
+        if max_weight_by_code is not None:
+            etf_codes = [code for code in codes if str(asset_metadata.get(str(code), {}).get("asset_type", "")).lower() == "etf"
+                         or str(asset_metadata.get(str(code), {}).get("is_stock_etf", "")).lower() in ("1", "true", "yes", "y", "是")]
+            active_fund_codes = [code for code in codes if code not in set(etf_codes)]
+            if active_fund_codes and not max_weight_by_code.empty:
+                fund_caps = max_weight_by_code.reindex(active_fund_codes).dropna()
+                tightest = ", ".join(f"{code}≤{cap:.1%}" for code, cap in fund_caps.sort_values().head(5).items())
+                print(f"主动基金容量上限（订单/基金规模≤{args.max_order_to_fund_aum:.0%}）：最紧约束 {tightest}")
+            if etf_codes:
+                etf_caps = max_weight_by_code.reindex(etf_codes).dropna()
+                caps = ", ".join(f"{code}≤{cap:.1%}" for code, cap in etf_caps.items())
+                print(f"ETF单日容量上限（{args.portfolio_aum_yi:.2f}亿元、参与率{args.etf_participation_rate:.0%}、{args.etf_adv_lookback}日ADV）：{caps}")
     elif args.portfolio_aum_yi is not None and args.source != "mock":
         if not args.pit_root:
             p.error("--portfolio-aum-yi 需要与--pit-root联用，才能审计ETF成交额。")

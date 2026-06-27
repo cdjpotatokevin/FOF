@@ -72,6 +72,7 @@ def compute_metrics(
     size_yi: float = float("nan"),
     size_sweet: tuple[float, float] = (2.0, 80.0),
     tenure_years: float = float("nan"),
+    skip_rolling: bool = False,
 ) -> FundMetrics:
     """汇总单只基金全部指标。"""
     active = rbsa.active_returns
@@ -92,12 +93,14 @@ def compute_metrics(
     m.excess_win_rate = float((active > 0).mean())
 
     # alpha 一致性：滚动窗口里 alpha 为正的比例（稳定性，不是一次性运气）
-    try:
-        roll = rolling_style_weights(fund_ret, factor_rets, rolling_window)
-        if len(roll):
-            m.alpha_consistency = float((roll["alpha_per_period"] > 0).mean())
-    except Exception:  # noqa: BLE001
-        m.alpha_consistency = float("nan")
+  # 回测快速模式跳过：每只基金约额外 100 次 RBSA，是全池评分的主要瓶颈。
+    if not skip_rolling:
+        try:
+            roll = rolling_style_weights(fund_ret, factor_rets, rolling_window)
+            if len(roll):
+                m.alpha_consistency = float((roll["alpha_per_period"] > 0).mean())
+        except Exception:  # noqa: BLE001
+            m.alpha_consistency = float("nan")
 
     # --- 风险 ---
     m.max_drawdown = max_drawdown_from_returns(fund_ret)

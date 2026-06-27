@@ -21,3 +21,6 @@ run_outputs/
 # OS/editor files
 .DS_Store
 .vscode/
+
+# Sync helper (temporary clone for push)
+_github_sync/

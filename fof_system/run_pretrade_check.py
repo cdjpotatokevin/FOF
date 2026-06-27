@@ -4,8 +4,8 @@
 典型用法：
 
   python -m fof_system.run_pretrade_check \
-      --portfolio-csv run_outputs/2026-06-24/full_eligible_open_subscription_20pct_capacity_portfolio.csv \
-      --backup-csv run_outputs/2026-06-24/full_eligible_open_subscription_20pct_capacity_backups.csv \
+      --portfolio-csv run_outputs/2026-06-25/wanneng2011_overlay_full.csv \
+      --backup-csv run_outputs/2026-06-25/wanneng2011_backups.csv \
       --status-source pit --pit-root fof_pit_data --asof 2026-06-23 \
       --report-out pretrade_report.csv --summary-out pretrade_summary.json
 

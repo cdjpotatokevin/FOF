@@ -1,13 +1,8 @@
 """第⑥层：整链滚动回测（walk-forward）。
 
-每个调仓日 t（月末），**只用 ≤t 的数据**完成：
-  ② 对候选基金做 RBSA → 风格调整后 alpha / IR → 选 top-N
-  ③ 取当期风格目标（StyleTimer 的 w_growth，信号本身因果）
-  ④ 由主动收益协方差 + alpha×R²，在风格目标约束下优化出基金/ETF 权重
-然后持有到下一个调仓日，用**之后**的真实收益结算，杜绝前视。
-
-为效率：数据一次性预取，walk-forward 全程在内存里点时切片，复用各层引擎函数。
-回测期内基金打分用"单次 RBSA"的轻量版（不做滚动一致性），权衡速度。
+每个调仓日 t（默认季度末），**只用 ≤t 的数据**调用 ``rebalance_at``：
+  ② 全池评分（按 PIT 快照键缓存）→ 候选筛选 → ③ 风格目标 → ④ 优化权重
+基金净值按需加载，不预取全区间 PIT 并集。
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -19,9 +14,7 @@ import pandas as pd
 from .. import config
 from ..data.base import DataProvider
 from ..data.pit import PITDataStore
-from .rbsa import run_rbsa
-from . import risk_model
-from .optimizer import optimize_portfolio
+from ..rebalance import collect_pit_codes, rebalance_at, pit_snapshot_label
 from .attribution import synth_etf_returns
 
 log = logging.getLogger("fof.backtest")
@@ -29,15 +22,16 @@ log = logging.getLogger("fof.backtest")
 
 @dataclass
 class BacktestOutput:
-    nav: pd.DataFrame                 # 列：strat / bench（净值，起点1）
-    weekly: pd.DataFrame              # 含毛收益、交易成本、净收益、基准与超额
-    weights_history: pd.DataFrame     # 各调仓日权重（行=日期，列=资产）
+    nav: pd.DataFrame
+    weekly: pd.DataFrame
+    weights_history: pd.DataFrame
     metrics: dict
     target_growth_history: pd.Series
     turnover_history: pd.Series
     cost_history: pd.Series
     rebalances: int = 0
     notes: list[str] = field(default_factory=list)
+    rebalance_log: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def _ann_return(ret: pd.Series, ppy: int) -> float:
@@ -52,7 +46,7 @@ def _max_dd(ret: pd.Series) -> float:
 
 
 class ChainBacktester:
-    def __init__(self, provider: DataProvider, codes: list[str],
+    def __init__(self, provider: DataProvider, codes: list[str] | None,
                  start: str, end: str, val_provider: DataProvider | None = None,
                  opt_cfg: config.OptimizerConfig = config.OPTIMIZER,
                  style_cfg: config.StyleTimingConfig = config.STYLE_TIMING,
@@ -61,7 +55,7 @@ class ChainBacktester:
                  asset_metadata: Mapping[str, Mapping[str, Any]] | None = None):
         self.p = provider
         self.vp = val_provider
-        self.codes = codes
+        self.codes = codes or []
         self.start = start
         self.end = end or pd.Timestamp.today().strftime("%Y-%m-%d")
         self.opt = opt_cfg
@@ -72,135 +66,138 @@ class ChainBacktester:
         self.freq = config.RETURN_FREQ
         self.ppy = config.PERIODS_PER_YEAR[self.freq]
         self._prepared = False
+        self._score_mem_cache: dict[str, pd.DataFrame] = {}
+        self._provider_kwargs: dict = {}
+        if getattr(self.p, "cache_dir", None):
+            self._provider_kwargs["cache_dir"] = str(self.p.cache_dir)
 
-    # -- 一次性预取数据 ----------------------------------------------------
     def _prepare(self):
         from ..pipeline import build_benchmark
-        from .style_timing import StyleTimer
 
         self.factor_df, self.bench_ret = build_benchmark(self.p, self.start, self.end)
-        # 基金周收益矩阵
-        cols = {}
-        for c in self.codes:
-            try:
-                nav = self.p.get_fund_nav(c, self.start, self.end)
-                cols[c] = self.p.to_returns(nav, self.freq)
-            except Exception as e:  # noqa: BLE001
-                log.warning("回测跳过 %s：%s", c, e)
-        self.fund_ret = pd.DataFrame(cols)
-        # 第③层风格目标（因果，预先整段算好，按调仓日 asof 取）
-        timer = StyleTimer(self.p, self.scfg, valuation_provider=self.vp)
-        self.style_views = timer.build_views(self.start, self.end)  # daily w_growth
+        self.fund_ret = pd.DataFrame()
+
+        if self.bcfg.prefetch_all_pit_codes and self.bcfg.full_universe_scoring and self.pit_store is not None:
+            prefetch_codes = collect_pit_codes(
+                self.pit_store, self.start, self.end,
+                strict_eligibility=self.bcfg.strict_eligibility,
+                freq=self.bcfg.rebalance_freq,
+            )
+            cols: dict[str, pd.Series] = {}
+            for code in prefetch_codes:
+                try:
+                    nav = self.p.get_fund_nav(code, self.start, self.end)
+                    cols[str(code)] = self.p.to_returns(nav, self.freq)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("回测跳过 %s：%s", code, exc)
+            self.fund_ret = pd.DataFrame(cols)
+            log.info("预取 %d 只基金收益（prefetch_all_pit_codes=True）", len(self.fund_ret.columns))
+        elif not self.bcfg.full_universe_scoring and self.codes:
+            self._prefetch_codes([str(c) for c in self.codes])
         self._prepared = True
 
-    # -- 单个调仓日：点时建组合 -------------------------------------------
-    @staticmethod
-    def _truthy(value: Any) -> bool:
-        return str(value).strip().lower() in ("1", "true", "yes", "y", "是")
+    def _ensure_return_column(self, code: str) -> None:
+        code = str(code)
+        if code in self.fund_ret.columns:
+            return
+        try:
+            nav = self.p.get_fund_nav(code, self.start, self.end)
+            self.fund_ret[code] = self.p.to_returns(nav, self.freq)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("动态加载收益失败 %s：%s", code, exc)
 
-    def _eligible_records(self, t: pd.Timestamp) -> dict[str, dict]:
-        """返回调仓日当时可投的候选元数据；无PIT时使用显式静态元数据。"""
-        if self.pit_store is None:
-            return {str(code): self.asset_metadata.get(str(code), {}) for code in self.fund_ret.columns}
-        universe = self.pit_store.read_universe_asof(t, asset_types=("fund", "etf"))
-        if universe.empty:
-            return {}
-        if "is_qdii" in universe:
-            qdii = universe["is_qdii"].astype(str).str.lower().isin(("1", "true", "yes"))
-            universe = universe[~qdii]
-        from .universe import filter_universe
-        universe = filter_universe(universe, asof=t, strict_eligibility=True)
-        records = {str(row["code"]): row.to_dict() for _, row in universe.iterrows()}
-        return {str(code): records[str(code)] for code in self.fund_ret.columns if str(code) in records}
-
-    def _eligible_codes(self, t: pd.Timestamp) -> list[str]:
-        """兼容旧调用方的候选代码视图。"""
-        return list(self._eligible_records(t))
+    def _prefetch_codes(self, codes: list[str]) -> None:
+        for code in codes:
+            self._ensure_return_column(str(code))
 
     def _rebalance(self, t: pd.Timestamp):
-        rf = config.RISK_FREE_ANNUAL / self.ppy
-        fac_hist = self.factor_df.loc[:t]
+        if self.bcfg.full_universe_scoring and self.pit_store is not None:
+            cache_key = f"{pit_snapshot_label(self.pit_store, t)}|{t.strftime('%Y-%m-%d')}"
+            result = rebalance_at(
+                self.p,
+                asof=t,
+                eval_start=self.bcfg.eval_start,
+                pit_store=self.pit_store,
+                val_provider=self.vp,
+                opt_cfg=self.opt,
+                strict_eligibility=self.bcfg.strict_eligibility,
+                portfolio_aum_yi=self.bcfg.portfolio_aum_yi,
+                max_order_to_fund_aum=self.bcfg.max_order_to_fund_aum,
+                etf_participation_rate=self.bcfg.etf_participation_rate,
+                etf_adv_lookback=self.bcfg.etf_adv_lookback,
+                enforce_active_fund_capacity=self.bcfg.enforce_active_fund_capacity,
+                enforce_etf_capacity=self.bcfg.enforce_etf_capacity,
+                score_cache_dir=self.bcfg.score_cache_dir or None,
+                capacity_asof=t.strftime("%Y-%m-%d"),
+                skip_rolling=self.bcfg.backtest_skip_rolling,
+                preselect_pool=(
+                    self.bcfg.backtest_preselect_pool
+                    if self.bcfg.backtest_preselect_pool > 0 else None
+                ),
+                workers=self.bcfg.backtest_workers,
+                provider_kwargs=self._provider_kwargs or None,
+            )
+            if not result.success or result.weights is None:
+                return None, None, None, None, result
+            if result.scored is not None:
+                self._score_mem_cache[cache_key] = result.scored
+            # 预取：当期持仓 + 优化候选（持有期结算与下期调仓 RBSA 更快）
+            prefetch = set(result.weights.index.astype(str))
+            if result.scored is not None and "code" in result.scored.columns:
+                from ..portfolio import select_full_universe_candidates
+                try:
+                    prefetch.update(select_full_universe_candidates(
+                        result.scored, n_active=self.opt.n_candidates,
+                        target_growth=result.target_growth,
+                    ))
+                except Exception:  # noqa: BLE001
+                    pass
+            self._prefetch_codes(sorted(prefetch))
+            all_etf = result.etf_codes | result.synthetic_etf_codes
+            return (
+                result.weights, result.target_growth,
+                result.synthetic_etf_codes, all_etf, result,
+            )
 
-        rows = []
-        active_map = {}
-        eligible = self._eligible_records(t)
-        for c, meta in eligible.items():
-            fr = self.fund_ret[c].loc[:t].dropna()
-            aligned = pd.concat([fr, fac_hist], axis=1, join="inner").dropna()
-            if len(aligned) < config.MIN_OBS:
-                continue
-            aligned = aligned.iloc[-config.EVAL_WINDOW:]
-            try:
-                rb = run_rbsa(aligned.iloc[:, 0], aligned[fac_hist.columns], rf_per_period=rf)
-            except Exception:  # noqa: BLE001
-                continue
-            active = rb.active_returns
-            avol = active.std(ddof=1) * np.sqrt(self.ppy)
-            alpha = rb.alpha_annual(self.ppy)
-            ir = alpha / avol if avol > 0 else 0.0
-            rows.append({"code": c, "alpha": alpha,
-                         "alpha_r2": alpha * np.clip(rb.style_r2, 0.0, 1.0),
-                         "style_r2": np.clip(rb.style_r2, 0.0, 1.0), "ir": ir,
-                         "growth_load": rb.weights.get("growth", config.BENCHMARK_WEIGHTS["growth"]),
-                         "asset_type": "etf" if (str(meta.get("asset_type", "")).lower() == "etf"
-                                                    or self._truthy(meta.get("is_stock_etf"))) else "fund"})
-            active_map[c] = active
+        # 兼容 mock / 显式 codes 的小样本路径
+        from .universe import filter_universe
+        from ..portfolio import build_portfolio, resolve_target_growth, select_full_universe_candidates
+        from ..pipeline import score_universe
 
-        if len(rows) < 2:
-            return None, None, None
-        cand = pd.DataFrame(rows).set_index("code")
+        asof_str = t.strftime("%Y-%m-%d")
+        eligible_codes = list(self.codes) or list(self.fund_ret.columns)
+        asset_metadata = self.asset_metadata
+        if self.pit_store is not None:
+            universe = self.pit_store.read_universe_asof(t, asset_types=("fund", "etf"))
+            if "is_qdii" in universe.columns:
+                qdii = universe["is_qdii"].astype(str).str.lower().isin(("1", "true", "yes"))
+                universe = universe[~qdii]
+            universe = filter_universe(universe, asof=t, strict_eligibility=self.bcfg.strict_eligibility)
+            eligible_set = set(universe["code"].astype(str))
+            eligible_codes = [str(c) for c in eligible_codes if str(c) in eligible_set]
+            asset_metadata = {str(row["code"]): row.to_dict() for _, row in universe.iterrows()}
 
-        # 轻量打分：alpha 与 IR 的组内 z 合成，选 top-N
-        def _z(s):
-            sd = s.std(ddof=0)
-            return (s - s.mean()) / sd if sd > 1e-12 else s * 0.0
-        cand["score"] = 0.6 * _z(cand["alpha"]) + 0.4 * _z(cand["ir"])
-        # 主动基金按alpha/IR选优；实际ETF作为已验证的风格工具进入优化器，但alpha固定为0。
-        active_top = cand[cand["asset_type"] != "etf"].sort_values("score", ascending=False).head(self.opt.n_candidates)
-        actual_etf = cand[cand["asset_type"] == "etf"]
-        top = pd.concat([active_top, actual_etf]).loc[lambda x: ~x.index.duplicated(keep="first")]
-        top_codes = top.index.tolist()
-
-        # 第③层风格目标（asof t）
-        wg = self.style_views["w_growth"]
-        target_g = (float(wg.loc[:t].iloc[-1]) if len(wg.loc[:t])
-                    else config.BENCHMARK_WEIGHTS["growth"])
-
-        # 协方差 + alpha（风格调整后alpha × R²后再收缩）
-        active_df = pd.DataFrame({c: active_map[c] for c in top_codes})
-        cov = risk_model.active_cov(active_df, shrink=self.opt.cov_shrink, ppy=self.ppy)
-        alpha = risk_model.shrink_alpha(top["alpha_r2"], self.opt.alpha_shrink)
-        growth_load = top["growth_load"].copy()
-        actual_etf_codes = top.index[top["asset_type"].eq("etf")].tolist()
-        alpha.loc[actual_etf_codes] = 0.0
-
-        etf_codes = list(actual_etf_codes)
-        synthetic_etf_codes = []
-        # 有PIT元数据的回测应只交易历史实际存在的ETF；合成ETF只保留给无PIT的mock验证。
-        if self.opt.use_style_etf and self.pit_store is None and not self.asset_metadata:
-            for ecode, meta in config.STYLE_ETF_ASSETS.items():
-                synthetic_etf_codes.append(ecode)
-                etf_codes.append(ecode)
-                alpha[ecode] = 0.0
-                growth_load[ecode] = meta["growth_load"]
-            cov = risk_model.add_etf_assets(cov, synthetic_etf_codes)
-
-        res = optimize_portfolio(
-            alpha=alpha, cov=cov, growth_load=growth_load, target_growth=target_g,
-            etf_codes=etf_codes, max_weight_fund=self.opt.max_weight_fund,
-            min_weight_fund=self.opt.min_weight_fund, risk_aversion=self.opt.risk_aversion,
-            etf_total_cap=self.opt.etf_total_cap, te_budget_annual=self.opt.te_budget_annual,
+        scored = score_universe(
+            self.p, codes=eligible_codes, start=self.bcfg.eval_start, end=asof_str,
+            pit_store=self.pit_store, universe_asof=asof_str,
+            strict_eligibility=self.bcfg.strict_eligibility,
         )
-        return res.weights, target_g, set(synthetic_etf_codes), set(etf_codes)
+        target_g = resolve_target_growth(self.p, self.vp, self.bcfg.eval_start, asof_str)
+        pick = select_full_universe_candidates(scored, n_active=self.opt.n_candidates, target_growth=target_g)
+        opt_result, detail = build_portfolio(
+            self.p, pick, target_g, self.bcfg.eval_start, asof_str,
+            cfg=self.opt, asset_metadata=asset_metadata or None,
+        )
+        if not opt_result.success:
+            return None, None, None, None, None
+        for code in opt_result.weights.index:
+            self._ensure_return_column(str(code))
+        synth = set(detail.loc[detail["type"] == "ETF补全", "code"].astype(str))
+        etf = set(detail.loc[detail["type"].isin(("ETF", "ETF补全")), "code"].astype(str))
+        return opt_result.weights, target_g, synth, etf, None
 
-    # -- 主循环 ------------------------------------------------------------
     def _transaction_cost(self, weights: pd.Series, previous: pd.Series | None,
                           etf_codes: set[str]) -> float:
-        """按目标权重变化估算单边交易成本。
-
-        首次建仓按从零建到目标组合计费；基金和 ETF 使用不同成本假设。
-        正式投资委员会材料应按产品费率、持有期和实际成交冲击成本覆写该简化模型。
-        """
         old = previous if previous is not None else pd.Series(dtype=float)
         codes = weights.index.union(old.index)
         delta = weights.reindex(codes, fill_value=0.0) - old.reindex(codes, fill_value=0.0)
@@ -217,25 +214,37 @@ class ChainBacktester:
         if len(widx) <= warmup + 4:
             raise RuntimeError("样本太短，无法回测。")
 
-        # 调仓日 = 每月最后一个周频日期，且已过 warmup
-        month_end = pd.Series(widx, index=widx).resample("ME").last().dropna()
+        month_end = pd.Series(widx, index=widx).resample(self.bcfg.rebalance_freq).last().dropna()
         rebal_dates = [d for d in month_end.values if d >= widx[warmup]]
         rebal_dates = pd.to_datetime(rebal_dates)
         if len(rebal_dates) < 2:
             raise RuntimeError("可调仓次数不足。")
 
-        # ETF 合成收益（整段）
+        freq_label = {"QE": "季度末", "ME": "月末"}.get(self.bcfg.rebalance_freq, self.bcfg.rebalance_freq)
+
         etf_ret_all = synth_etf_returns(
             self.factor_df, {e: config.STYLE_ETF_ASSETS[e]["growth_load"]
                              for e in config.STYLE_ETF_ASSETS})
 
-        weekly_rows = []
+        weekly_rows: list[dict] = []
         w_hist, tg_hist, turn_hist, cost_hist = {}, {}, {}, {}
+        log_rows: list[dict] = []
         prev_w = None
         prev_etf_codes: set[str] = set()
+        skipped = 0
         notes = [
+            f"调仓频率：{freq_label}（{len(rebal_dates)} 个调仓日）",
             f"单边交易成本：主动基金 {self.bcfg.fund_one_way_cost:.2%}，ETF {self.bcfg.etf_one_way_cost:.2%}",
-            "首次建仓与每次调仓均已从策略收益中扣除估算交易成本。",
+            "净值加载：按需（持仓+候选），不预取全 PIT 并集"
+            if not self.bcfg.prefetch_all_pit_codes else "净值加载：全 PIT 并集预取",
+            "调仓路径：rebalance_at（全池评分 + select_full_universe_candidates + build_portfolio）"
+            if self.bcfg.full_universe_scoring and self.pit_store is not None
+            else "调仓路径：显式候选 codes + 生产优化器",
+            f"主动基金容量：{'启用' if self.bcfg.enforce_active_fund_capacity else '关闭'}",
+            f"ETF成交额容量：{'启用' if self.bcfg.enforce_etf_capacity else '关闭'}",
+            f"评分加速：skip_rolling={self.bcfg.backtest_skip_rolling}，"
+            f"preselect={self.bcfg.backtest_preselect_pool or '全池'}，"
+            f"workers={self.bcfg.backtest_workers}",
         ]
         if self.pit_store is None:
             notes.append("未提供PIT数据仓：候选池为静态输入，可能含幸存者偏差。")
@@ -244,32 +253,61 @@ class ChainBacktester:
 
         for i in range(len(rebal_dates) - 1):
             t0, t1 = rebal_dates[i], rebal_dates[i + 1]
-            weights, target_g, synthetic_etf_set, all_etf_codes = self._rebalance(t0)
-            if weights is None:
-                continue
-            w_hist[t0] = weights
-            tg_hist[t0] = target_g
-            old_w = prev_w
-            # 换手（单边）
-            if old_w is not None:
-                allc = weights.index.union(old_w.index)
-                turn_hist[t0] = float((weights.reindex(allc, fill_value=0)
-                                       - old_w.reindex(allc, fill_value=0)).abs().sum() / 2)
-            trade_cost = self._transaction_cost(weights, old_w, all_etf_codes | prev_etf_codes)
-            cost_hist[t0] = trade_cost
-            prev_w = weights
-            prev_etf_codes = all_etf_codes
+            out = self._rebalance(t0)
+            if out[0] is None:
+                skipped += 1
+                reason = ""
+                scored_n = candidate_n = ""
+                if out[4] is not None:
+                    reason = getattr(out[4], "skip_reason", "")
+                    scored_n = getattr(out[4], "scored_count", "")
+                    candidate_n = getattr(out[4], "candidate_count", "")
+                log_rows.append({
+                    "asof": t0, "success": False, "skip_reason": reason or "rebalance_failed",
+                    "scored_count": scored_n, "candidate_count": candidate_n,
+                })
+                if prev_w is None:
+                    continue
+                weights = prev_w
+                target_g = tg_hist.get(rebal_dates[i - 1] if i > 0 else t0, config.BENCHMARK_WEIGHTS["growth"])
+                synthetic_etf_set = set()
+                all_etf_codes = prev_etf_codes
+                trade_cost = 0.0
+            else:
+                weights, target_g, synthetic_etf_set, all_etf_codes, reb_res = out
+                w_hist[t0] = weights
+                tg_hist[t0] = target_g
+                log_rows.append({
+                    "asof": t0, "success": True, "skip_reason": "",
+                    "scored_count": getattr(reb_res, "scored_count", ""),
+                    "candidate_count": getattr(reb_res, "candidate_count", ""),
+                    "n_holdings": int((weights > 1e-6).sum()),
+                })
+                old_w = prev_w
+                if old_w is not None:
+                    allc = weights.index.union(old_w.index)
+                    turn_hist[t0] = float((weights.reindex(allc, fill_value=0)
+                                           - old_w.reindex(allc, fill_value=0)).abs().sum() / 2)
+                trade_cost = self._transaction_cost(weights, old_w, all_etf_codes | prev_etf_codes)
+                cost_hist[t0] = trade_cost
+                prev_w = weights
+                prev_etf_codes = all_etf_codes
 
-            # 持有 (t0, t1]：用之后的周收益结算（防前视）
             sub = self.factor_df.loc[(self.factor_df.index > t0) & (self.factor_df.index <= t1)].index
             for j, d in enumerate(sub):
                 gross_r = 0.0
+                missing_weight = 0.0
                 for code, wt in weights.items():
                     if code in synthetic_etf_set:
                         gross_r += wt * etf_ret_all.loc[d, code]
                     elif code in self.fund_ret.columns and d in self.fund_ret.index:
                         rv = self.fund_ret.loc[d, code]
-                        gross_r += wt * (rv if pd.notna(rv) else 0.0)
+                        if pd.isna(rv):
+                            missing_weight += wt
+                            continue
+                        gross_r += wt * rv
+                if missing_weight > 1e-8:
+                    log.debug("%s 缺失收益权重 %.2f%%，未按 0 计入", d.date(), missing_weight * 100)
                 cost = trade_cost if j == 0 else 0.0
                 weekly_rows.append({
                     "date": d, "gross_port_ret": gross_r,
@@ -278,6 +316,8 @@ class ChainBacktester:
 
         if not weekly_rows:
             raise RuntimeError("回测无任何持有期收益。")
+        if skipped:
+            notes.append(f"调仓失败/跳过 {skipped} 次；失败期持有上一期权重或空仓。")
 
         weekly = pd.DataFrame(weekly_rows).set_index("date").sort_index()
         gross_pser = weekly["gross_port_ret"]
@@ -310,6 +350,7 @@ class ChainBacktester:
             "annual_turnover": float(sum(turn_hist.values()) / max(len(pser) / self.ppy, 1e-9)),
             "total_transaction_cost": float(weekly["transaction_cost"].sum()),
             "n_weeks": len(pser),
+            "skipped_rebalances": skipped,
         }
 
         return BacktestOutput(
@@ -320,4 +361,5 @@ class ChainBacktester:
             turnover_history=pd.Series(turn_hist),
             cost_history=pd.Series(cost_hist),
             rebalances=len(w_hist), notes=notes,
+            rebalance_log=pd.DataFrame(log_rows),
         )

@@ -215,6 +215,8 @@ def build_portfolio(
     cfg: config.OptimizerConfig = config.OPTIMIZER,
     asset_metadata: Mapping[str, Mapping[str, Any]] | None = None,
     max_weight_by_code: Mapping[str, float] | None = None,
+    min_weight_by_code: Mapping[str, float] | None = None,
+    external_reserved_weight: float = 0.0,
 ) -> tuple[OptResult, pd.DataFrame]:
     """构建组合。target_growth 为第③层目标成长暴露（0~1）。
 
@@ -268,6 +270,8 @@ def build_portfolio(
         risk_aversion=cfg.risk_aversion, etf_total_cap=cfg.etf_total_cap,
         te_budget_annual=cfg.te_budget_annual,
         max_weight_by_code=max_weight_by_code,
+        min_weight_by_code=min_weight_by_code,
+        weight_budget=1.0 - float(external_reserved_weight),
     )
     report = risk_model.ex_ante_risk_report(
         weights=res.weights, alpha=alpha, cov=cov, growth_load=growth_load,
@@ -286,6 +290,8 @@ def build_portfolio(
     aum_map = {str(code): meta.get("aum_yi", float("nan")) for code, meta in metadata.items()}
     subscription_map = {str(code): meta.get("subscription_status", "") for code, meta in metadata.items()}
     redemption_map = {str(code): meta.get("redemption_status", "") for code, meta in metadata.items()}
+    company_map = {str(code): meta.get("management_company", "") for code, meta in metadata.items()}
+    manager_start_map = {str(code): meta.get("manager_start", "") for code, meta in metadata.items()}
 
     def _aum(value: Any) -> float:
         try:
@@ -309,6 +315,8 @@ def build_portfolio(
             "aum_yi": _aum(aum_map.get(code, float("nan"))),
             "subscription_status": subscription_map.get(code, ""),
             "redemption_status": redemption_map.get(code, ""),
+            "management_company": company_map.get(code, ""),
+            "manager_start": manager_start_map.get(code, ""),
             "type": (
                 "ETF补全" if code in set(synthetic_etf_codes)
                 else "ETF" if code in set(actual_etf_codes)

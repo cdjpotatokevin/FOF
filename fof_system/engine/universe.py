@@ -2,30 +2,41 @@
 from __future__ import annotations
 import pandas as pd
 from ..config import UniverseFilter, DEFAULT_FILTER
+from .subscription import subscription_open_mask as _subscription_open
+
+
+def management_company_allowed(company: object, whitelist: list[str]) -> bool:
+    """判断 PIT ``management_company`` 是否落在允许的管理人白名单内。"""
+    text = str(company or "").strip()
+    if not text or not whitelist:
+        return not bool(whitelist)
+    for allowed in sorted(whitelist, key=len, reverse=True):
+        if allowed.endswith("证券"):
+            stem = allowed.removesuffix("证券")
+            if text.startswith(stem) and "证券" in text:
+                return True
+            continue
+        stem = allowed.removesuffix("基金")
+        if not text.startswith(stem):
+            continue
+        if "基金" not in text or "管理" not in text:
+            continue
+        if "证券资产" in text:
+            continue
+        return True
+    return False
+
+
+def _management_company_mask(companies: pd.Series, whitelist: list[str]) -> pd.Series:
+    if not whitelist:
+        return pd.Series(True, index=companies.index)
+    return companies.fillna("").astype(str).apply(lambda c: management_company_allowed(c, whitelist))
 
 
 def _bool_col(df: pd.DataFrame, column: str, default: bool = False) -> pd.Series:
     if column not in df:
         return pd.Series(default, index=df.index)
     return df[column].astype(str).str.lower().isin(("1", "true", "yes"))
-
-
-def _subscription_open(df: pd.DataFrame) -> pd.Series:
-    """判断主动基金是否处于可建仓的开放申购状态。
-
-    仅接受“开放申购”或“开放大额申购”语义；暂停、限额/限制、封闭及缺失状态
-    一律不放行，避免把“可赎回”误当作“可申购”。
-    """
-    status = df.get("subscription_status", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
-    opening = status.str.contains(r"开放(?:大额)?申购", regex=True, na=False)
-    blocked = status.str.contains(r"暂停|封闭|限额|限购|限制", regex=True, na=False)
-    # 供应商若显式提供单日限额/限购标志或金额，任何非空限额均视为不可申购。
-    explicit_limit = _bool_col(df, "has_daily_subscription_limit")
-    if "daily_subscription_limit_yi" in df:
-        explicit_limit = explicit_limit | pd.to_numeric(
-            df["daily_subscription_limit_yi"], errors="coerce"
-        ).notna()
-    return opening & ~blocked & ~explicit_limit
 
 
 def filter_universe(
@@ -81,7 +92,20 @@ def filter_universe(
         active_fund_ok = (~etf) & (aum >= flt.min_active_equity_size_yi) & (inception <= minimum_inception)
         if flt.require_open_subscription:
             active_fund_ok = active_fund_ok & _subscription_open(df)
+        if flt.require_manager_tenure and flt.min_manager_tenure_years > 0:
+            if "manager_start" not in df.columns:
+                active_fund_ok = active_fund_ok & False
+            else:
+                manager_start = pd.to_datetime(df["manager_start"], errors="coerce")
+                minimum_manager = point - pd.Timedelta(days=365.25 * flt.min_manager_tenure_years)
+                active_fund_ok = active_fund_ok & manager_start.notna() & (manager_start <= minimum_manager)
         stock_etf_ok = etf & (aum >= flt.min_stock_etf_size_yi)
+        if flt.allowed_management_companies:
+            if "management_company" not in df.columns:
+                return df.iloc[0:0].copy()
+            company_ok = _management_company_mask(df["management_company"], flt.allowed_management_companies)
+            active_fund_ok = active_fund_ok & company_ok
+            stock_etf_ok = stock_etf_ok & company_ok
         df = df[active_fund_ok | stock_etf_ok]
 
     return df.reset_index(drop=True)

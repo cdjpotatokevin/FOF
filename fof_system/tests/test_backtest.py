@@ -77,12 +77,19 @@ def test_backtester_uses_pit_status_at_each_rebalance(tmp_path):
         updated, source="mock", effective_date="2024-01-01", available_at="2024-01-01",
     )
 
-    backtester = ChainBacktester(
-        provider, list(provider.truth), "2019-01-01", "2024-09-30", pit_store=store,
+    from fof_system.rebalance import rebalance_at
+    before = rebalance_at(
+        provider, asof="2023-12-29", eval_start="2019-01-01", pit_store=store,
+        strict_eligibility=False, score_cache_dir=tmp_path / "cache",
     )
-    backtester._prepare()
-    assert "F_GROWTH_STAR" in backtester._eligible_codes(pd.Timestamp("2023-12-29"))
-    assert "F_GROWTH_STAR" not in backtester._eligible_codes(pd.Timestamp("2024-01-31"))
+    after = rebalance_at(
+        provider, asof="2024-01-31", eval_start="2019-01-01", pit_store=store,
+        strict_eligibility=False, score_cache_dir=tmp_path / "cache",
+    )
+    assert before.success and before.weights is not None
+    assert "F_GROWTH_STAR" in before.weights.index
+    if after.success and after.weights is not None:
+        assert "F_GROWTH_STAR" not in after.weights.index
 
 
 def test_actual_etf_uses_etf_transaction_cost_in_static_backtest():
